@@ -33,22 +33,30 @@ def show_parameters(path="hp_results.csv", float_prec=5):
         if c in df.columns:
             df[c] = df[c].astype('Int64')  # Int64はNaNを許容する整数型
 
-    # 比較キー（存在するものを優先順で採用）
+    # 比較キー（存在するものを優先順で採用）- 実際のカラムから選択
     preferred_keys = ["d_model", "n_heads", "d_head", "d_rope", "d_c", "d_cQ", 
                      "batch_size", "lr", "num_epochs"]
+    # 実際に存在するカラムのみをフィルタリング
     keys = [c for c in preferred_keys if c in df.columns]
     if not keys:
         # フォールバック: 時刻/メトリクス/フラグ以外をキーに
-        keys = [c for c in df.columns if c not in ["timestamp", "type", "loss"]]
+        keys = [c for c in df.columns if c not in ["timestamp", "type", "loss", "attn"]]
 
     # 同一 (keys, type) に複数行がある場合は「最後の実行」を採用
     if "timestamp" in df.columns:
         df = df.sort_values("timestamp")
     df = df.drop_duplicates(subset=keys + ["type"], keep="last")
 
-    # 列順を整える
-    order = [c for c in preferred_keys if c in df.columns] + ["type", "loss"]
-    df = df[order]
+    # 列順を整える - 実際のカラム順を尊重
+    # 優先順位: パラメータ系 → type → loss → その他
+    parameter_cols = [c for c in preferred_keys if c in df.columns]
+    other_cols = [c for c in df.columns if c not in parameter_cols + ["type", "loss"]]
+    
+    # 表示順序を設定
+    display_order = parameter_cols + ["type", "loss"] + sorted(other_cols)
+    # 実際に存在するカラムのみをフィルタリング
+    display_order = [c for c in display_order if c in df.columns]
+    df = df[display_order]
 
     # 並べ替え（小さいloss順）
     if "loss" in df.columns:
@@ -56,10 +64,15 @@ def show_parameters(path="hp_results.csv", float_prec=5):
 
     # ---- HTMLで罫線つき表示（Styler）----
     # フォーマット設定
-    format_dict = {"loss": f"{{:.{float_prec}f}}"}
-    for col in ["d_c", "d_cQ", "batch_size", "num_epochs"]:
+    format_dict = {}
+    if "loss" in df.columns:
+        format_dict["loss"] = f"{{:.{float_prec}f}}"
+    
+    # 整数カラムのフォーマット
+    integer_format_cols = ["d_c", "d_cQ", "batch_size", "num_epochs"]
+    for col in integer_format_cols:
         if col in df.columns:
-            format_dict[col] = "{:.0f}"  # 整数表示
+            format_dict[col] = "{:.0f}"
     
     sty = (df.style
            .format(format_dict)
