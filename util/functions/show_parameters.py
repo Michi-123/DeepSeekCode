@@ -1,4 +1,4 @@
-#@title show_show_parameters
+#@title show_parameters
 import os
 import pandas as pd
 from IPython.display import display
@@ -40,28 +40,17 @@ def show_parameters(path="hp_results.csv", float_prec=5):
         df = df.sort_values("timestamp")
     df = df.drop_duplicates(subset=keys + ["type"], keep="last")
 
-    # MLA と MHA を別々にしてから横結合（ピボット不使用で安全）
-    cols_for_side = keys + ["loss"]
-    mla = (df[df["type"] == "MLA"][cols_for_side]
-           .rename(columns={"loss": "MLA_loss"}))
-    mha = (df[df["type"] == "MHA"][cols_for_side]
-           .rename(columns={"loss": "MHA_loss"}))
-
-    out = pd.merge(mla, mha, on=keys, how="outer")
-
     # 列順を整える
-    order = [c for c in preferred_keys if c in out.columns] + \
-            [c for c in ["MLA_loss", "MHA_loss"] if c in out.columns]
-    out = out[order]
+    order = [c for c in preferred_keys if c in df.columns] + ["type", "loss"]
+    df = df[order]
 
     # 並べ替え（小さいloss順）
-    sort_cols = [c for c in ["MLA_loss", "MHA_loss"] if c in out.columns]
-    if sort_cols:
-        out = out.sort_values(sort_cols, ascending=True, na_position="last").reset_index(drop=True)
+    if "loss" in df.columns:
+        df = df.sort_values("loss", ascending=True, na_position="last").reset_index(drop=True)
 
     # ---- HTMLで罫線つき表示（Styler）----
-    sty = (out.style
-           .format({c: f"{{:.{float_prec}f}}" for c in ["MLA_loss", "MHA_loss"] if c in out.columns})
+    sty = (df.style
+           .format({"loss": f"{{:.{float_prec}f}}"})
            .hide(axis="index")
            .set_table_styles([
                {"selector": "table",
