@@ -212,7 +212,7 @@ class MHA(nn.Module):
 
         dropout = 0.1
         self.attention = ScaledDotProductAttention(d_model, dropout)
-        self.fc = nn.Linear(self.n_heads * self.d_head, d_model)
+        self.output_head = nn.Linear(self.n_heads * self.d_head, d_model)
         self.dropout = nn.Dropout(dropout)
 
         # Xavier init（既存実装に合わせる）
@@ -281,37 +281,41 @@ class MHA(nn.Module):
 
         # 6) ヘッド結合 & 出力
         x = x.transpose(1, 2).contiguous().view(N, -1, H * D)
-        x = self.fc(x)
+        x = self.output_head(x)
         x = self.dropout(x)
+        
         return x
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, args, MHA):
         super().__init__()
+        
         self.norm1 = RMSNorm(args.d_model)
         self.attn = MHA(args)
         self.norm2 = RMSNorm(args.d_model)
         self.ffn  = FeedForward(args)
 
     def forward(self, x, freqs_cis, mask=None, train=False):
-
-        x = x + self.attn(self.norm1(x), freqs_cis, mask=mask, train=train)
+    
+        output = self.attn(self.norm1(x), freqs_cis, mask=mask, train=train)
+        x = x + output['hidden_state']
         output = self.ffn(self.norm2(x))
         x = x + output['hidden_state'] # Add the hidden_state from the ffn output
+        
         return x
 
 #@title Transformer
 class Transformer(nn.Module):
     def __init__(self, args, MHA=MHA):
+    
         super().__init__()
-        # d_ff = args.d_model * 4
         self.embedding = nn.Embedding(args.vocab_size, args.d_model)
 
         self.layers = torch.nn.ModuleList()
         for _ in range(args.n_layers):
             self.layers.append(TransformerBlock(args, MHA))
-
+        # 内包表記を使う場合
         # self.blocks = nn.ModuleList([
         #     TransformerBlock(args)
         # for _ in range(n_layers)])
