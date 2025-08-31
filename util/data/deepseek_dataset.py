@@ -206,8 +206,8 @@ CORPUS_PATH = os.path.join(CORPUS_DIR, "aozora_corpus.txt" )
 
 #os.makedirs(CORPUS_DIR, exist_ok=True)
         
-        
-class AozoraCharLevelDataset(Dataset):
+class __AozoraCharLevelDataset_old(Dataset):
+
     def __init__(self, urls, seq_len):
         super().__init__()
 
@@ -252,6 +252,41 @@ class AozoraCharLevelDataset(Dataset):
         y = chunk[1:]   # next-token labels
         return x, y
 
+
+class AozoraCharLevelDataset(Dataset):
+
+    def __init__(self, text, seq_len):
+        super().__init__()
+
+        """Build char-level vocabulary from text. Returns (stoi, itos)."""
+        chars = sorted(set(text))
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for ch, i in self.stoi.items()}
+
+        self.vocab_size = len(self.stoi)
+        self.data = encode_text(text, self.stoi) #train_ids
+        
+        self.seq_len = seq_len
+
+        # last index where we can take seq_len+1 tokens
+        self.max_start = len(self.data) - (self.seq_len + 1)
+        if self.max_start < 0:
+            raise ValueError(f"Corpus too small for seq_len={seq_len}. "
+                             f"Need at least {seq_len+1} tokens, got {len(self.data)}.")
+                             
+
+    def __len__(self):
+        return self.max_start + 1
+
+    def __getitem__(self, idx):
+        chunk = self.data[idx : idx + self.seq_len + 1]
+        x = chunk[:-1]  # input
+        y = chunk[1:]   # next-token labels
+        return x, y
+
+"""
+ファイルを作成して再読み込みする方式
+"""
 def make_aozora_corpus(urls):
     # 保存先ディレクトリ
     os.makedirs(CORPUS_DIR, exist_ok=True)
@@ -302,6 +337,32 @@ def make_aozora_corpus(urls):
 
     print("Corpus saved to", CORPUS_PATH)
 
+
+def get_aozora_corpus(urls):
+    # 保存先ディレクトリ
+    os.makedirs(CORPUS_DIR, exist_ok=True)
+
+    texts = []
+
+    for title, url in urls.items():
+        print(f"Downloading: {title} ({url})")
+        res = requests.get(url)
+        res.encoding = "shift_jis"  # 青空文庫はShift_JISが多い
+
+        html = res.text
+
+        # ルビ除去 （例：外（はず）れ → 外れ）
+        text = re.sub(r'（[^）]*）', '', html)
+
+        # HTMLタグを削除
+        clean_text = re.sub(r'<[^>]+>', '', text)
+
+         texts.append(clean_text)
+
+    # <eos> で結合して一つのコーパスに
+    corpus = " <eos> ".join(texts)
+
+    return corpus
 
 
 ###################################################################
