@@ -356,7 +356,7 @@ def get_aozora_corpus(urls):
         # HTMLタグを削除
         clean_text = re.sub(r'<[^>]+>', '', text)
 
-         texts.append(clean_text)
+        texts.append(clean_text)
 
     # <eos> で結合して一つのコーパスに
     corpus = " <eos> ".join(texts)
