@@ -204,7 +204,6 @@ class CharLevelDataset(Dataset):
 CORPUS_DIR     = "corpus"
 CORPUS_PATH = os.path.join(CORPUS_DIR, "aozora_corpus.txt" )
 
-#os.makedirs(CORPUS_DIR, exist_ok=True)
         
 class __AozoraCharLevelDataset_old(Dataset):
 
