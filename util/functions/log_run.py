@@ -1,89 +1,65 @@
-#@title show_parameters
-import os
-import pandas as pd
-from IPython.display import display
+import os, csv
+from datetime import datetime
+LOG_PATH = "hp_results.csv"
 
-def show_parameters(path="hp_results.csv", float_prec=5):
+def log_run(args, losses_list, use_MLA, path=LOG_PATH):
+    """
+    実験1回分の結果をCSVに1行追記。
+    use_MLA=False -> 'MLA'、True -> 'MHA' として保存します。
+    """
+    final_loss = float(losses_list[-1])
+    attn_type = "MLA" if use_MLA else "MHA"
+    row = {
+        "type": attn_type,                  # ★ typeを先頭に
+        "n_layers": getattr(args, "n_layers", None),
+        "d_model": args.d_model,
+        "n_heads": args.n_heads,
+        "d_head": getattr(args, "d_head", None),
+        "d_rope": getattr(args, "d_rope", None),
+        "d_c": getattr(args, "d_c", None),
+        "d_cQ": getattr(args, "d_cQ", None),
+        "batch_size": getattr(args, "batch_size", None),
+        "lr": getattr(args, "lr", None),
+        "num_epochs": getattr(args, "num_epochs", None),
+        "loss": final_loss,                 # ★ lossを後ろに
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # ★ timestampを最後に
+    }
+    # ★ 指定された順序でヘッダーを定義
+    header = ["type", "n_layers", "d_model", "n_heads", "d_head", "d_rope", "d_c", "d_cQ",
+              "batch_size", "lr", "num_epochs", "loss", "timestamp"]
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+def show_results(path=LOG_PATH, sort_by="loss"):  # ★ sort_byを"loss"に変更
+    """CSVを読み込んで簡易表示（loss昇順）"""
     if not os.path.exists(path):
-        print(f"結果ファイルがありません: {path}")
+        print("まだ結果ファイルがありません。")
         return
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.sort(key=lambda r: float(r[sort_by]))
+    # 表示
+    cols = rows[0].keys()
+    print(" | ".join(cols))
+    print("-" * 80)
+    for r in rows:
+        print(" | ".join(str(r[c]) for c in cols))
 
-    df = pd.read_csv(path)
-
-    # 旧ログ互換 & 正規化
-    if "type" not in df.columns and "attn" in df.columns:
-        df["type"] = df["attn"]
-    elif "type" not in df.columns:
-        df["type"] = "MLA"
-    
-    # 型の正規化
-    df["type"] = df["type"].map({True: "MHA", False: "MLA"}).fillna(df["type"])
-    df["type"] = df["type"].replace({"attn": "MHA"})  # 旧バージョンの互換性
-
-    # 数値化（ある列だけ）
-    numeric_columns = ["n_layers", "d_model", "n_heads", "d_head", "d_rope", "d_c", "d_cQ", 
-                      "batch_size", "lr", "num_epochs", "loss"]
-    for c in numeric_columns:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # 整数で扱うカラムを指定
-    integer_columns = ["n_layers", "d_c", "d_cQ", "batch_size", "num_epochs"]
-    for c in integer_columns:
-        if c in df.columns:
-            df[c] = df[c].astype('Int64')  # Int64はNaNを許容する整数型
-
-    # 比較キー（存在するものを優先順で採用）- 実際のカラムから選択
-    preferred_keys = ["type", "n_layers", "d_model", "n_heads", "d_head", "d_rope", "d_c", "d_cQ", 
-                     "batch_size", "lr", "num_epochs"]
-    # 実際に存在するカラムのみをフィルタリング
-    keys = [c for c in preferred_keys if c in df.columns]
-    if not keys:
-        # フォールバック: 時刻/メトリクス/フラグ以外をキーに
-        keys = [c for c in df.columns if c not in ["timestamp", "loss", "attn"]]
-
-    # 同一 (keys) に複数行がある場合は「最後の実行」を採用
-    if "timestamp" in df.columns:
-        df = df.sort_values("timestamp")
-    df = df.drop_duplicates(subset=keys, keep="last")
-
-    # ★ 指定された順序で列を並べ替え
-    desired_order = ["type", "n_layers", "d_model", "n_heads", "d_head", "d_rope", "d_c", "d_cQ", 
-                    "batch_size", "lr", "num_epochs", "loss", "timestamp"]
-    # 実際に存在するカラムのみをフィルタリング
-    display_order = [c for c in desired_order if c in df.columns]
-    # 存在するがdesired_orderにないカラムを追加
-    extra_cols = [c for c in df.columns if c not in display_order]
-    display_order.extend(extra_cols)
-    
-    df = df[display_order]
-
-    # 並べ替え（小さいloss順）
-    if "loss" in df.columns:
-        df = df.sort_values("loss", ascending=True, na_position="last").reset_index(drop=True)
-
-    # ---- HTMLで罫線つき表示（Styler）----
-    # フォーマット設定
-    format_dict = {}
-    if "loss" in df.columns:
-        format_dict["loss"] = f"{{:.{float_prec}f}}"
-    
-    # 整数カラムのフォーマット
-    integer_format_cols = ["n_layers", "d_c", "d_cQ", "batch_size", "num_epochs"]
-    for col in integer_format_cols:
-        if col in df.columns:
-            format_dict[col] = "{:.0f}"
-    
-    sty = (df.style
-           .format(format_dict)
-           .hide(axis="index")
-           .set_table_styles([
-               {"selector": "table",
-                "props": [("border-collapse", "collapse"), ("border", "1px solid #888")]},
-               {"selector": "th, td",
-                "props": [("border", "1px solid #888"), ("padding", "6px 10px")]},
-               {"selector": "thead th",
-                "props": [("background", "#000000"), ("font-weight", "600")]}
-           ]))
-
-    display(sty)
+def show_results(path=LOG_PATH, sort_by="final_loss"):
+    """CSVを読み込んで簡易表示（final_loss昇順）"""
+    if not os.path.exists(path):
+        print("まだ結果ファイルがありません。")
+        return
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.sort(key=lambda r: float(r[sort_by]))
+    # 表示
+    cols = rows[0].keys()
+    print(" | ".join(cols))
+    print("-" * 80)
+    for r in rows:
+        print(" | ".join(str(r[c]) for c in cols))
