@@ -27,6 +27,12 @@ def show_parameters(path="hp_results.csv", float_prec=5):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # 整数で扱うカラムを指定
+    integer_columns = ["d_c", "d_cQ", "batch_size", "num_epochs"]
+    for c in integer_columns:
+        if c in df.columns:
+            df[c] = df[c].astype('Int64')  # Int64はNaNを許容する整数型
+
     # 比較キー（存在するものを優先順で採用）
     preferred_keys = ["d_model", "n_heads", "d_head", "d_rope", "d_c", "d_cQ", 
                      "batch_size", "lr", "num_epochs"]
@@ -49,8 +55,14 @@ def show_parameters(path="hp_results.csv", float_prec=5):
         df = df.sort_values("loss", ascending=True, na_position="last").reset_index(drop=True)
 
     # ---- HTMLで罫線つき表示（Styler）----
+    # フォーマット設定
+    format_dict = {"loss": f"{{:.{float_prec}f}}"}
+    for col in ["d_c", "d_cQ", "batch_size", "num_epochs"]:
+        if col in df.columns:
+            format_dict[col] = "{:.0f}"  # 整数表示
+    
     sty = (df.style
-           .format({"loss": f"{{:.{float_prec}f}}"})
+           .format(format_dict)
            .hide(axis="index")
            .set_table_styles([
                {"selector": "table",
