@@ -6,13 +6,13 @@ import os, csv
 from datetime import datetime
 LOG_PATH = "hp_results.csv"
 
-def log_run(args, losses_list, use_MHA, path=LOG_PATH):
+def log_run(args, losses_list, use_MLA, path=LOG_PATH):
     """
     実験1回分の結果をCSVに1行追記。
-    use_MHA=False -> 'MLA'、True -> 'MHA' として保存します。
+    use_MLA=False -> 'MLA'、True -> 'MHA' として保存します。
     """
     final_loss = float(losses_list[-1])
-    attn_type = "MHA" if use_MHA else "MLA"
+    attn_type = "MLA" if use_MLA else "MHA"
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "d_model": args.d_model,
