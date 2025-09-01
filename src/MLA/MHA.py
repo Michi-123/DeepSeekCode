@@ -1,3 +1,6 @@
+import torch
+import torch.nn as nn
+
 #@title MHA
 class MHA(nn.Module):
     """
