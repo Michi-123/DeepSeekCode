@@ -144,7 +144,7 @@ class MLA(nn.Module):
         v = v.transpose(1, 2)
 
         # Sacled Dot-Product Attetnionの計算
-        h, attn_weight = self.attention(q, k, v, mask)
+        h, w = self.attention(q, k, v, mask)
 
         # 出力を整形して返す
         h = h.transpose(1, 2)
@@ -153,6 +153,6 @@ class MLA(nn.Module):
 
         output = {}
         output['hidden_state'] = h
-        output['attn_weight'] = attn_weight
+        output['attention_weight'] = w
 
         return output
