@@ -658,7 +658,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc2 = nn.Linear(d_model * 4, d_model)
 
-nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
 
     def forward(self, x, train=False):
