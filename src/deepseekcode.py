@@ -9,6 +9,8 @@ import time
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def debug(x,y):
+    pass
 
 d_model = 8 
 n_layers = 1 
@@ -889,9 +891,6 @@ class DeepSeekCode(DeepSeekCode):
 
         predicted = main_logits.contiguous().view(-1, self.vocab_size)
         target = main_target_ids.contiguous().view(-1)
-
-        debug('predicted', predicted.shape)
-        debug('target',target.shape)
 
         main_loss = self.criterion(predicted, target)
         main_balance_loss = calculate_balance_loss(main_affinity_scores, self.args)
