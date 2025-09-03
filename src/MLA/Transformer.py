@@ -158,13 +158,13 @@ class ScaledDotProductAttention(nn.Module):
             # True（= 未来 = 禁止）を −∞ にする
             score = score.masked_fill(mask, torch.finfo(score.dtype).min)
 
-        attention_weights = F.softmax(score, dim=-1)
+        attention_weight = F.softmax(score, dim=-1)
         # 特定の単語に注意を払いすぎないようにdropoutを適用します
-        attn_weights = self.dropout(attn_weights)
+        attention_weight = self.dropout(attention_weight)
         # Weighted value
-        attention_output = torch.matmul(attn_weights, v)
+        attention_output = torch.matmul(attention_weight, v)
 
-        return attention_output, attention_weights
+        return attention_output, attention_weight
         
         
 
