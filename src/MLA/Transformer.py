@@ -205,7 +205,7 @@ class TransformerBlock(nn.Module):
 
 #@title Transformer
 class Transformer(nn.Module):
-    def __init__(self, args, MHA=MHA):
+    def __init__(self, args, MHA):
     
         super().__init__()
         self.embedding = nn.Embedding(args.vocab_size, args.d_model)
