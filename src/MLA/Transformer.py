@@ -26,6 +26,13 @@ import torch.nn.init as init
 
 
 
+# @title Args
+class Args:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
 # @title precompute_freqs_cis
 def precompute_freqs_cis(args, device='cpu'):
 
