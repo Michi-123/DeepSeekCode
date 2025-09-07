@@ -1,29 +1,11 @@
-#@title TransformerBlock
-import torch
-import torch.nn.functional as F
-from torch import nn
-
 # -*- coding: utf-8 -*-
 """# ライブラリーのインポート"""
 
-#@title import
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-
-
-# -*- coding: utf-8 -*-
-"""# ライブラリーのインポート"""
-
-#@title import
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.nn.init as init
-
 
 
 # @title Args
