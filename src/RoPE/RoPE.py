@@ -29,6 +29,11 @@ def precompute_freqs_cis(args, device='cpu'):
     # トークンの位置インデックスの生成 （要device指定）
     m = torch.arange(args.max_seq_len, dtype=torch.float32, device=device)
 
+
+    if hasattr(args, "rope_scaling_factor") and args.rope_scaling_factor > 1.0:
+        scale = math.log(args.max_seq_len) / math.log(args.max_seq_len // args.rope_scaling_factor)
+        m = m * scale
+        
     # 回転角の計算
     rotation_angles = torch.outer(m, freqs)
 
