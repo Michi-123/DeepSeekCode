@@ -12,7 +12,7 @@ with open(os.path.join(current_path, 'README.md'), encoding='utf-8') as f:
 setup(
     name='DeepSeekCode', 
     packages=find_packages(exclude=('*.pyc',)),
-    version='1.0.0.0',
+    version='0.0.0.0',
     license='MIT', 
     install_requires=[],
     author='Michiyasu Uchiyama',
