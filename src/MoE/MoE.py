@@ -1,245 +1,221 @@
-#@title MoE (Fix)
+# DeepSeekMoE_refactored.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class Expert(nn.Module):
-    """Individual expert network for MoE"""
-    def __init__(self, d_model, intermediate_dim):
+    """Simple FFN-style expert (論文の細部実装はプロジェクトに合わせて調整してください)"""
+    def __init__(self, d_model, inter_dim):
         super().__init__()
-        self.gate_proj = nn.Linear(d_model, intermediate_dim, bias=False)
-        self.up_proj = nn.Linear(d_model, intermediate_dim, bias=False)
-        self.down_proj = nn.Linear(intermediate_dim, d_model, bias=False)
+        # 論文のFFNは GELU や SwiGLU 系が多いですが、ここは SiLU + 2-layer を使用
+        self.fc1 = nn.Linear(d_model, inter_dim, bias=True)
+        self.act = F.silu
+        self.fc2 = nn.Linear(inter_dim, d_model, bias=True)
 
     def forward(self, x):
-        gate = F.silu(self.gate_proj(x))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
+        # x: [N, d_model]
+        return self.fc2(self.act(self.fc1(x)))
 
-class MoE(nn.Module):
+
+class DeepSeekMoE(nn.Module):
     """
-    DeepSeekMoE implementation following DeepSeek-V2/V3 papers
-    with auxiliary-loss-free load balancing strategy
+    DeepSeekMoE (論文準拠に近い実装)
+    - Shared experts を全トークンに加算
+    - Routed experts を Top-K で選択し、選択内正規化した gating を掛け合わせて出力を合成
+    - Auxiliary-loss-free bias update（stepごとに実行）
+    - Sequence-wise balance loss (α * sum(f_i * P_i))
     """
     def __init__(self, args):
         super().__init__()
-        self.dim = args.d_model
-        self.n_shared_experts = args.n_shared_experts  # 共有専門家の数
-        self.n_routed_experts = args.n_routed_experts  # ルーティング専門家の数
-        self.top_k = args.n_activated_experts  # 選択する専門家数 (Top-K)
-        self.bias_update_speed = args.moe_bias_update_speed  # バイアス更新速度 γ
-        self.alpha = getattr(args, 'moe_alpha', 0.001)  # バランシングロスの重み α
+        self.d_model = args.d_model
+        self.n_shared = args.n_shared_experts
+        self.n_routed = args.n_routed_experts
+        self.top_k = args.n_activated_experts
+        self.gamma = args.moe_bias_update_speed  # bias update speed γ
+        # V3は alpha を非常に小さくすることを推奨
+        self.alpha = getattr(args, "moe_alpha", 1e-6)
 
-        # 専門家ネットワーク
-        self.shared_experts = nn.ModuleList(
-            [Expert(args.d_model, args.moe_inter_dim) for _ in range(self.n_shared_experts)]
-        )
-        self.routed_experts = nn.ModuleList(
-            [Expert(args.d_model, args.moe_inter_dim) for _ in range(self.n_routed_experts)]
-        )
+        # experts
+        self.shared_experts = nn.ModuleList([Expert(self.d_model, args.moe_inter_dim) for _ in range(self.n_shared)])
+        self.routed_experts = nn.ModuleList([Expert(self.d_model, args.moe_inter_dim) for _ in range(self.n_routed)])
 
-        # ルーティングパラメータ
-        self.centroids = nn.Parameter(torch.randn(self.n_routed_experts, args.d_model))
-        self.biases = nn.Parameter(torch.zeros(self.n_routed_experts))
+        # routing parameters
+        # centroids (paper: e_i centroid vectors used to compute sigmoid(u^T e_i))
+        self.centroids = nn.Parameter(torch.randn(self.n_routed, self.d_model) * (1.0 / (self.d_model ** 0.5)))
+        # biases used only for selection (aux-loss-free)
+        self.biases = nn.Parameter(torch.zeros(self.n_routed))
 
-        self.init_expert_freqs()
-        self.output = {}
+        # usage stats (optional, for monitoring)
+        self.register_buffer("_expert_usage_counts", torch.zeros(self.n_routed, dtype=torch.long))
+        self._reset_usage()
 
-    def init_expert_freqs(self):
-        """専門家使用頻度の初期化"""
-        self.expert_freqs = {idx: 0 for idx in range(self.n_routed_experts)}
+    def _reset_usage(self):
+        self._expert_usage_counts.zero_()
 
-    def update_biases(self, gating_weights, topk_indices):
+    def compute_affinity(self, inputs):
         """
-        Auxiliary-loss-free load balancing strategy from DeepSeek-V3
-        過負荷の専門家のバイアスを下げ、未使用の専門家のバイアスを上げる
+        inputs: [B, T, d_model]
+        return s_i_t: [B, T, n_routed] (sigmoid affinities)
         """
-        # 各専門家の負荷を計算
-        expert_load = torch.zeros(self.n_routed_experts, device=gating_weights.device)
+        # Flatten for matmul: (B*T, d)
+        B, T, D = inputs.shape
+        x_flat = inputs.view(-1, D)  # [B*T, D]
+        # affinity logits: x_flat @ centroids.T -> [B*T, n_routed]
+        logits = x_flat @ self.centroids.t()
+        s = torch.sigmoid(logits)  # [B*T, n_routed]
+        return s.view(B, T, self.n_routed)  # [B, T, n_routed]
 
-        for k in range(self.top_k):
-            expert_indices = topk_indices[:, :, k]  # [batch, seq]
-            weights = gating_weights[:, :, k]       # [batch, seq]
-
-            # ベクトル化された負荷計算
-            for i in range(self.n_routed_experts):
-                mask = (expert_indices == i)
-                expert_load[i] += weights[mask].sum()
-
-        mean_load = expert_load.mean()
-
-        # バイアス更新（修正版）
-        # 過負荷の専門家: バイアスを下げて選ばれにくくする
-        # 未使用/低負荷の専門家: バイアスを上げて選ばれやすくする
-        for i in range(self.n_routed_experts):
-            if expert_load[i] > mean_load:  # 過負荷の場合
-                self.biases.data[i] -= self.bias_update_speed
-            else:  # 低負荷/未使用の場合
-                self.biases.data[i] += self.bias_update_speed
-
-    def compute_balance_loss(self, affinity_scores, topk_indices):
+    def update_biases_step(self, affinity_scores, topk_indices):
         """
-        DeepSeek論文に基づくバランスロス計算
-        L_balance = α * Σ(f_i * P_i)
+        bias update per training step (aux-loss-free):
+        - compute load per expert on the whole batch (sum of gating-selection counts)
+        - expected_load = total_tokens * top_k / n_routed
+        - if load > expected -> biases[i] -= gamma else biases[i] += gamma
         """
-        batch_size, seq_len, num_experts = affinity_scores.shape
-        total_tokens = batch_size * seq_len
+        # affinity_scores: [B, T, n_routed] (before bias)
+        B, T, n = affinity_scores.shape
+        device = affinity_scores.device
+        total_tokens = B * T
+        # Count how many times each expert was selected (Top-K selection)
+        # topk_indices: [B, T, top_k]
+        # flatten
+        flat_idx = topk_indices.view(-1)  # [(B*T*top_k)]
+        counts = torch.bincount(flat_idx, minlength=self.n_routed).to(dtype=torch.float32, device=device)
+        # Each selection corresponds to one (token, expert) assignment; expected total selections = total_tokens * top_k
+        expected_count_per_expert = (total_tokens * self.top_k) / max(1, self.n_routed)
+        # Update biases in-place (paper: decrease if overloaded, increase if underloaded)
+        with torch.no_grad():
+            overloaded = counts > expected_count_per_expert
+            self.biases.data[overloaded] -= self.gamma
+            self.biases.data[~overloaded] += self.gamma
 
-        # f_i: 専門家iに割り当てられたトークンの割合
-        f_i = torch.zeros(num_experts, device=affinity_scores.device)
-        for i in range(num_experts):
-            # 専門家iがTop-Kに選ばれたトークン数をカウント
-            mask = (topk_indices == i).any(dim=-1)  # [batch, seq]
-            f_i[i] = mask.sum().float() / total_tokens
-
-        # P_i: 専門家iの平均ゲート確率
-        # 全専門家に対してsoftmax正規化を適用
-        normalized_scores = F.softmax(affinity_scores, dim=-1)
-        P_i = normalized_scores.mean(dim=(0, 1))  # [num_experts]
-
-        # バランスロス: α * Σ(f_i * P_i)
-        balance_loss = self.alpha * (f_i * P_i).sum()
-
-        return balance_loss
-
-    def forward(self, input_embeddings, train=False):
+    def compute_sequence_balance_loss(self, affinity_scores, topk_indices):
         """
-        MoE forward pass following DeepSeek-V2/V3 formulation:
-        h'_t = h_t + Σ(shared_experts) + Σ(G_j,t * routed_expert_j(h_t))
+        Compute L_bal = α * sum_i ( f_i * P_i )
+        - f_i: fraction (per-batch) of tokens for which expert i is in Top-K (scaled as in paper)
+        - P_i: average normalized score per expert (normalized over experts per token then mean over tokens)
         """
-        batch_size, seq_len = input_embeddings.shape[:2]
+        B, T, n = affinity_scores.shape
+        device = affinity_scores.device
+        total_tokens = B * T
 
-        # 共有専門家の処理 (全トークンがすべての共有専門家を利用)
-        shared_outputs = []
-        for expert in self.shared_experts:
-            shared_outputs.append(expert(input_embeddings))
-        shared_output = torch.stack(shared_outputs, dim=2).mean(dim=2)
+        # 1) compute f_i:
+        # topk_indices: [B, T, top_k]
+        topk_mask = torch.zeros_like(affinity_scores, dtype=torch.bool, device=device)
+        topk_mask.scatter_(2, topk_indices, True)  # True where selected
+        # Count tokens where expert i is in Top-K
+        counts = topk_mask.any(dim=-1).sum(dim=(0, 1)).to(dtype=torch.float32, device=device)  # [n]
+        # f_i as fraction of tokens (paper's eqn uses normalization factor; here we adopt fraction)
+        f_i = counts / float(total_tokens)  # [n]
 
-        # ルーティング専門家の処理 (Top-K 選択)
-        # アフィニティスコア計算（DeepSeek-V3ではsigmoidを使用）
-        affinity_scores = torch.sigmoid(input_embeddings @ self.centroids.T)
+        # 2) compute P_i:
+        # normalize affinity_scores across experts for each token (eq.19)
+        denom = affinity_scores.sum(dim=2, keepdim=True) + 1e-12
+        s_normalized = affinity_scores / denom  # [B, T, n]
+        P_i = s_normalized.mean(dim=(0, 1))  # mean over tokens -> [n]
 
-        # バイアス項を加えたスコア（Top-K選択に使用）
-        # auxiliary-loss-free戦略に基づく
-        expanded_biases = self.biases.unsqueeze(0).unsqueeze(0)  # [1, 1, num_experts]
-        biased_scores = affinity_scores + expanded_biases
+        bal = self.alpha * (f_i * P_i).sum()
+        return bal
 
-        # Top-K選択（バイアス付きスコアを使用）
-        topk_values, topk_indices = torch.topk(biased_scores, self.top_k, dim=-1)
+    def forward(self, inputs, train=False):
+        """
+        inputs: [B, T, d_model]
+        returns dict with:
+         - hidden_state: [B, T, d_model]
+         - affinity_scores: [B, T, n_routed] (raw sigmoid affinities)
+         - gating_weights: [B, T, top_k]
+         - topk_indices: [B, T, top_k]
+         - balance_loss (if train)
+        """
+        B, T, D = inputs.shape
+        assert D == self.d_model, "input dim mismatch"
 
-        # ゲーティング重み（元のアフィニティスコアから計算）
-        # バイアスは選択のみに使用し、重み計算には元のスコアを使用
-        selected_affinity_scores = torch.gather(affinity_scores, -1, topk_indices)
-        gating_weights = F.softmax(selected_affinity_scores, dim=-1)
-        # V2の場合
-        # Gating weights: softmax over ALL affinity scores, then gather selected ones
-        # all_gating_weights = F.softmax(affinity_scores, dim=-1)  # Normalize over ALL experts
-        # gating_weights = torch.gather(all_gating_weights, -1, topk_indices)
+        # 1) Shared experts: sum their outputs (論文は加算)
+        if self.n_shared > 0:
+            # apply each shared expert to all tokens (vectorized)
+            # inputs_flat: [B*T, D]
+            inputs_flat = inputs.view(-1, D)
+            shared_sum = torch.zeros_like(inputs_flat)
+            for expert in self.shared_experts:
+                shared_sum = shared_sum + expert(inputs_flat)
+            shared_output = shared_sum.view(B, T, D)  # [B, T, D]
+        else:
+            shared_output = torch.zeros_like(inputs)
 
-        # 効率的な専門家計算のための前処理
-        # インデックスとゲーティング重みを1次元に平坦化
-        flat_topk_indices = topk_indices.view(-1)
-        flat_gating_weights = gating_weights.view(-1)
+        # 2) Routed experts: compute affinities and Top-K selection
+        affinity = self.compute_affinity(inputs)  # [B, T, n_routed] (sigmoid)
+        # For selection only, add biases (broadcast)
+        biased = affinity + self.biases.view(1, 1, -1)  # [B, T, n_routed]
 
-        # 入力埋め込みをTop-K分だけ複製してから平坦化
-        expanded_input_embeddings = input_embeddings.unsqueeze(2).expand(-1, -1, self.top_k, -1)
-        flat_input_embeddings = expanded_input_embeddings.contiguous().view(-1, self.dim)
+        # Top-K selection on biased scores
+        topk_vals, topk_idx = torch.topk(biased, self.top_k, dim=-1)  # [B, T, top_k]
+        # Build gating weights as normalized original s values among selected ones (paper: normalize among selected affinity scores)
+        # gather selected original affinity values
+        selected_s = torch.gather(affinity, 2, topk_idx)  # [B, T, top_k]
+        # make g'_i,t = s_i if selected else 0; then normalize across selected
+        # normalization across top_k dimension
+        sum_selected = selected_s.sum(dim=-1, keepdim=True) + 1e-12
+        gating = selected_s / sum_selected  # [B, T, top_k]
 
-        # 使用される専門家の特定と計算
-        used_experts = torch.unique(flat_topk_indices)
-        expert_outputs = {}
+        # 3) Prepare per-selection inputs and compute corresponding expert outputs
+        # Expand inputs to match top_k selections: [B, T, top_k, D] -> flatten to [B*T*top_k, D]
+        expanded_inputs = inputs.unsqueeze(2).expand(-1, -1, self.top_k, -1).contiguous()
+        flat_inputs = expanded_inputs.view(-1, D)  # [B*T*top_k, D]
 
-        for expert_idx in used_experts:
-            if not train:
-                self.expert_freqs[expert_idx.item()] += 1
-            
-            mask = (flat_topk_indices == expert_idx)
-            if mask.any():
-                expert_outputs[int(expert_idx)] = self.routed_experts[expert_idx](flat_input_embeddings[mask])
+        flat_topk_idx = topk_idx.view(-1)  # [B*T*top_k]
+        flat_gating = gating.view(-1)      # [B*T*top_k]
 
-        # 各専門家の出力を重み付きで集約
-        routed_output = torch.zeros_like(flat_input_embeddings)
-        for expert_idx in used_experts:
-            mask = (flat_topk_indices == expert_idx)
-            if mask.any():
-                corresponding_weights = flat_gating_weights[mask]
-                weighted_expert_output = expert_outputs[int(expert_idx)] * corresponding_weights.unsqueeze(-1)
-                routed_output[mask] = weighted_expert_output
+        # Find unique expert indices used to avoid calling all experts
+        used_experts = torch.unique(flat_topk_idx)
 
-        # 平坦化された出力を元の形状に戻し、Top-K次元で合計
-        reshaped_routed_output = routed_output.view(batch_size, seq_len, self.top_k, -1)
-        routed_output = reshaped_routed_output.sum(dim=2)
+        # Compute outputs for used experts in a batched way
+        device = inputs.device
+        routed_flat_output = torch.zeros_like(flat_inputs)  # will store weighted outputs
 
-        # 最終出力 (入力 + 共有専門家 + ルーティング専門家)
-        # DeepSeek論文の式: h'_t = h_t + shared + routed
-        output_embeddings = input_embeddings + shared_output + routed_output
+        for e_idx in used_experts:
+            e = int(e_idx.item())
+            mask = (flat_topk_idx == e)
+            if not mask.any():
+                continue
+            idx_positions = torch.nonzero(mask, as_tuple=False).squeeze(1)
+            selected_inputs = flat_inputs[idx_positions]  # [N_e, D]
+            expert_out = self.routed_experts[e](selected_inputs)  # [N_e, D]
+            # multiply by corresponding gating weights
+            gw = flat_gating[idx_positions].unsqueeze(-1)  # [N_e, 1]
+            routed_flat_output[idx_positions] = expert_out * gw  # weighted
 
-        # 訓練時の処理
-        balance_loss = None
-        if train:
-            # Auxiliary-loss-free load balancing
-            self.update_biases(gating_weights, topk_indices)
-            
-            # 補完的なバランスロス計算
-            balance_loss = self.compute_balance_loss(affinity_scores, topk_indices)
+            # update usage counter for monitoring if needed
+            if train:
+                # accumulate selection counts (coarse)
+                self._expert_usage_counts[e] += mask.sum().long()
 
-        # 出力の準備
-        self.output = {
-            'hidden_state': output_embeddings,
-            'affinity_scores': affinity_scores,
-            'gating_weights': gating_weights,
-            'topk_indices': topk_indices
+        # Reshape back: [B, T, top_k, D] then sum over top_k
+        routed_output = routed_flat_output.view(B, T, self.top_k, D).sum(dim=2)  # [B, T, D]
+
+        # 4) Final output: input + shared + routed (論文の式)
+        output_hidden = inputs + shared_output + routed_output  # [B, T, D]
+
+        result = {
+            "hidden_state": output_hidden,
+            "affinity_scores": affinity,
+            "gating_weights": gating,
+            "topk_indices": topk_idx
         }
-        
-        if balance_loss is not None:
-            self.output['balance_loss'] = balance_loss
 
-        return self.output
+        if train:
+            # update biases according to batch-wise loads
+            self.update_biases_step(affinity, topk_idx)
+            # compute sequence-wise balance loss (with very small alpha)
+            bal_loss = self.compute_sequence_balance_loss(affinity, topk_idx)
+            result["balance_loss"] = bal_loss
 
-    def get_expert_usage_stats(self):
-        """専門家使用統計の取得"""
-        total_usage = sum(self.expert_freqs.values())
-        if total_usage == 0:
-            return {i: 0.0 for i in range(self.n_routed_experts)}
-        
-        return {i: freq / total_usage for i, freq in self.expert_freqs.items()}
+        return result
 
-    def reset_expert_freqs(self):
-        """専門家使用頻度のリセット"""
-        self.expert_freqs = {idx: 0 for idx in range(self.n_routed_experts)}
+    def get_usage(self):
+        total = int(self._expert_usage_counts.sum().item())
+        if total == 0:
+            return {i: 0.0 for i in range(self.n_routed)}
+        return {i: (self._expert_usage_counts[i].item() / total) for i in range(self.n_routed)}
 
-
-# 使用例とテスト用のダミークラス
-class Args:
-    def __init__(self):
-        self.d_model = 512
-        self.n_shared_experts = 2
-        self.n_routed_experts = 8
-        self.n_activated_experts = 2
-        self.moe_inter_dim = 1024
-        self.moe_bias_update_speed = 0.001
-        self.moe_alpha = 0.001
-
-
-def test_moe():
-    """MoE実装のテスト"""
-    args = Args()
-    moe = MoE(args)
-    
-    # テスト用の入力
-    batch_size, seq_len = 2, 4
-    input_embeddings = torch.randn(batch_size, seq_len, args.d_model)
-    
-    # Forward pass
-    output = moe(input_embeddings, train=True)
-    
-    print(f"Input shape: {input_embeddings.shape}")
-    print(f"Output shape: {output['hidden_state'].shape}")
-    print(f"Balance loss: {output['balance_loss'].item():.6f}")
-    print(f"Expert usage: {moe.get_expert_usage_stats()}")
-    
-    return moe, output
-
-
-if __name__ == "__main__":
-    test_moe()
+    def reset_usage(self):
+        self._expert_usage_counts.zero_()
