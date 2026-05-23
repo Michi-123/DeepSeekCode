@@ -6,7 +6,6 @@ from DeepSeekCode.src.deepseekcode import MLA
 from DeepSeekCode.src.deepseekcode import MHA
 from DeepSeekCode.src.deepseekcode import precompute_freqs_cis
 from DeepSeekCode.src.deepseekcode import apply_rope
-from DeepSeekCode.src.deepseekcode import RoPE
 from DeepSeekCode.src.deepseekcode import KVCache
 from DeepSeekCode.src.deepseekcode import Expert
 from DeepSeekCode.src.deepseekcode import MoE
