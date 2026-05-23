@@ -2,3 +2,4 @@ push.bat
 *.bak
 *.back
 *.backup
+".github/" 
