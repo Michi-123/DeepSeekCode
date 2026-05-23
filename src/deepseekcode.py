@@ -473,7 +473,7 @@ class Expert(nn.Module):
         # 出力投影
         self.w2 = nn.Linear(moe_inter_dim, d_model, bias=False)
         # 入力投影
-        self.w3 = nn.Linear(d_model, moe    _inter_dim, bias=False)
+        self.w3 = nn.Linear(d_model, moe_inter_dim, bias=False)
 
         # 重みの初期化
         nn.init.normal_(self.w1.weight, std=0.006)
