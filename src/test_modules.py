@@ -112,18 +112,41 @@ def pattern_demo(model, args, num_epochs=100, lr=1e-3, seed=0, show_plot=True):
         opt.step()
     print('loss', round(loss.item(), 4))
 
-    out = _forward(model, args, torch.LongTensor([[7, 4, 1, 2]]))
-    last_logit = out['logits'][0][-1]
-    next_token = int(last_logit.argmax())
-    print('「7, 4, 1, 2」の次に予測したトークン:', next_token)
+    model.eval()  # テスト時はドロップアウトを止めて安定したロジットにする
+
+    # (1) 「7, 4, 1, 2」 の次 → 3 になってほしい（1,2 の続き）
+    out1 = _forward(model, args, torch.LongTensor([[7, 4, 1, 2]]))
+    last1 = out1['logits'][0][-1]
+    next_after_7412 = int(last1.argmax())
+    print('「7, 4, 1, 2」の次に予測したトークン:', next_after_7412, '（期待: 3）')
+
+    # (2) 「1, 2, 3」 の次 → 6 か 9 になってほしい
+    out2 = _forward(model, args, torch.LongTensor([[1, 2, 3]]))
+    last2 = out2['logits'][0][-1]
+    next_after_123 = int(last2.argmax())
+    print('「1, 2, 3」の次に予測したトークン:', next_after_123, '（期待: 6 または 9）')
 
     if show_plot:
+        # グラフ1（従来どおり残す）: 「7, 4, 1, 2」の次は 3
         plt.figure(figsize=(7, 3))
-        plt.bar(range(10), last_logit[:10].tolist())
+        plt.bar(range(10), last1[:10].tolist())
         plt.xticks(range(10))
-        plt.title('次トークンのロジット（0〜9）')
+        plt.xlabel('トークン'); plt.ylabel('ロジット')
+        plt.title('「7, 4, 1, 2」の次に来るトークン（3 になってほしい）')
         plt.show()
-    return {'loss': loss.item(), 'next_token': next_token}
+
+        # グラフ2（追加）: 「1, 2, 3」の次は 6 か 9
+        plt.figure(figsize=(7, 3))
+        bars = plt.bar(range(10), last2[:10].tolist())
+        bars[6].set_color('crimson'); bars[9].set_color('crimson')  # 6 と 9 を強調
+        plt.xticks(range(10))
+        plt.xlabel('トークン'); plt.ylabel('ロジット')
+        plt.title('「1, 2, 3」の次に来るトークン（6 か 9 になってほしい）')
+        plt.show()
+
+    return {'loss': loss.item(),
+            'next_after_7412': next_after_7412,
+            'next_after_123': next_after_123}
 
 
 # ============================================================
