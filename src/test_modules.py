@@ -94,14 +94,20 @@ def integration_test(model, args, batch_size=2, seed=42):
     return {'loss': loss.item()}
 
 
-def pattern_demo(model, args, num_epochs=100, lr=1e-3, seed=0, show_plot=True):
-    """「1,2,3 の次に 6 か 9 が来る」パターンを覚えさせ、結果を確認する。"""
+def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42, show_plot=True):
+    """学習用データ tokens を受け取り、パターン学習を行って結果を確認する。
+
+    tokens: 形 (batch, context_size + 1 + multi_token_depth) の LongTensor。
+            受講生が Colab 側で手作業で作って渡す想定。
+            None のときだけ、既定パターン（1,2,3→6 / 1,2,3→9）を内部生成する。
+    """
     torch.manual_seed(seed)
-    batch_size = 2
-    tokens = torch.randint(0, args.vocab_size,
-                           (batch_size, args.context_size + 1 + args.multi_token_depth))
-    tokens[0][1:5] = torch.tensor([1, 2, 3, 6])
-    tokens[1][10:14] = torch.tensor([1, 2, 3, 9])
+    if tokens is None:
+        batch_size = 2
+        tokens = torch.randint(0, args.vocab_size,
+                               (batch_size, args.context_size + 1 + args.multi_token_depth))
+        tokens[0][1:5] = torch.tensor([1, 2, 3, 6])
+        tokens[1][10:14] = torch.tensor([1, 2, 3, 9])
 
     model.train()
     opt = torch.optim.Adam(model.parameters(), lr=lr)
