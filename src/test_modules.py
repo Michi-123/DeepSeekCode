@@ -73,6 +73,59 @@ def _animate(frame_paths, interval_ms=600, figsize=(9, 5), gif_path=None):
     return ani
 
 
+def _set_aux_mode(model, args, aux_loss_free):
+    """学習の負荷分散モードを設定する（全 MoE 層に適用）。
+
+    aux_loss_free=True  : auxiliary loss を使わない（DeepSeek-V3 方式）。
+                          → aux_loss_alpha を 0 にして、expert bias で負荷分散する。
+    aux_loss_free=False : auxiliary loss を使う（従来方式）。
+                          → aux_loss_alpha は args の値のまま。expert bias は更新しない。
+    戻り値: その学習で使う全 MoE 層のリスト（bias 更新に使う）。
+    """
+    moes = [m for m in model.modules() if isinstance(m, dsm.MoE)]
+    for m in moes:
+        m.aux_loss_alpha = 0.0 if aux_loss_free else args.aux_loss_alpha
+    return moes
+
+
+def _train_loop(model, args, data, num_epochs, batch_size, lr, aux_loss_free,
+                snapshot_cb=None, snapshot_every=10, seed=42):
+    """共通の学習ループ（四則演算・日本語・パターン学習で使い回す）。
+
+    aux_loss_free で負荷分散の方式を切り替える。テスト/集計の処理は呼び出し側で共通。
+    snapshot_cb(epoch) を渡すと、各スナップショットのタイミングで呼ばれる（動画フレーム用）。
+    """
+    torch.manual_seed(seed)
+    model.train()
+    moes = _set_aux_mode(model, args, aux_loss_free)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    N = data.size(0)
+    mode = 'aux-loss-free（expert bias で負荷分散）' if aux_loss_free else 'auxiliary loss あり（従来方式）'
+    print(f'学習開始（{num_epochs} エポック, データ {N} 問, モード: {mode}）')
+    if snapshot_cb is not None:
+        snapshot_cb(0)
+    for ep in range(1, num_epochs + 1):
+        perm = torch.randperm(N)
+        el = 0.0
+        for i in range(0, N, batch_size):
+            b = data[perm[i:i + batch_size]]
+            opt.zero_grad()
+            loss = model.pretrain(b)
+            loss.backward()
+            opt.step()
+            # aux-loss-free のときだけ、expert bias を更新して負荷分散する
+            if aux_loss_free:
+                for m in moes:
+                    m.update_expert_bias()
+            el += loss.item()
+        if snapshot_cb is not None and (ep % snapshot_every == 0 or ep == num_epochs):
+            snapshot_cb(ep)
+        if ep % 50 == 0 or ep == num_epochs:
+            print(f'  epoch {ep:4d}  loss {el / (N / batch_size):.4f}')
+    print('学習終了')
+    return model
+
+
 # ============================================================
 # 1) 基本動作テスト
 # ============================================================
@@ -94,12 +147,14 @@ def integration_test(model, args, batch_size=2, seed=42):
     return {'loss': loss.item()}
 
 
-def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42, show_plot=True):
+def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42,
+                 aux_loss_free=True, show_plot=True):
     """学習用データ tokens を受け取り、パターン学習を行って結果を確認する。
 
     tokens: 形 (batch, context_size + 1 + multi_token_depth) の LongTensor。
             受講生が Colab 側で手作業で作って渡す想定。
             None のときだけ、既定パターン（1,2,3→6 / 1,2,3→9）を内部生成する。
+    aux_loss_free: True で auxiliary loss を使わず expert bias で負荷分散（DeepSeek-V3 方式）。
     """
     torch.manual_seed(seed)
     if tokens is None:
@@ -109,14 +164,9 @@ def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42, sho
         tokens[0][1:5] = torch.tensor([1, 2, 3, 6])
         tokens[1][10:14] = torch.tensor([1, 2, 3, 9])
 
-    model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    for ep in range(num_epochs):
-        opt.zero_grad()
-        loss = model.pretrain(tokens)
-        loss.backward()
-        opt.step()
-    print('loss', round(loss.item(), 4))
+    # 学習（共通ループを使い回す。tokens 全体を1バッチとして学習）
+    _train_loop(model, args, tokens, num_epochs, batch_size=tokens.size(0), lr=lr,
+                aux_loss_free=aux_loss_free, snapshot_cb=None, seed=seed)
 
     model.eval()  # テスト時はドロップアウトを止めて安定したロジットにする
 
@@ -150,8 +200,7 @@ def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42, sho
         plt.title('「1, 2, 3」の次に来るトークン（6 か 9 になってほしい）')
         plt.show()
 
-    return {'loss': loss.item(),
-            'next_after_7412': next_after_7412,
+    return {'next_after_7412': next_after_7412,
             'next_after_123': next_after_123}
 
 
@@ -251,18 +300,18 @@ def plot_expert_usage_bar(usage, target_layer, n_routed, ds,
 
 
 def train_arith_with_animation(model, args, ds, num_epochs=400, batch_size=64, lr=2e-3,
-                               snapshot_every=10, frame_interval_ms=600,
+                               aux_loss_free=True, snapshot_every=10, frame_interval_ms=600,
                                frame_dir='arith_frames', seed=42):
-    """四則演算を学習しながら、専門家の使われ方の変化を動画にして表示する。"""
-    torch.manual_seed(seed)
-    model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    """四則演算を学習しながら、専門家の使われ方の変化を動画にして表示する。
+
+    aux_loss_free=True で auxiliary loss を使わず expert bias で負荷分散（DeepSeek-V3 方式）。
+    学習ループは共通の _train_loop を使い回し、スナップショット処理だけここで与える。
+    """
     layer_ids = _moe_layer_ids(model)
     target_layer = layer_ids[-1]
     nr = args.n_routed_experts
     os.makedirs(frame_dir, exist_ok=True)
     frames = []
-    N = ds.data.size(0)
 
     def snap(epoch):
         usage, acc = collect_expert_usage(model, args, ds)
@@ -274,29 +323,11 @@ def train_arith_with_animation(model, args, ds, num_epochs=400, batch_size=64, l
                               save_path=p, show=False)
         frames.append(p)
 
-    print(f'学習開始（{num_epochs} エポック, データ {N} 問）')
-    snap(0)
-    for ep in range(1, num_epochs + 1):
-        perm = torch.randperm(N)
-        el = 0.0
-        for i in range(0, N, batch_size):
-            b = ds.data[perm[i:i + batch_size]]
-            opt.zero_grad()
-            loss = model.pretrain(b)
-            loss.backward()
-            opt.step()
-            for layer in model.main_model.layers:
-                if isinstance(layer.feed_forward, dsm.MoE):
-                    layer.feed_forward.update_expert_bias()
-            el += loss.item()
-        if ep % snapshot_every == 0 or ep == num_epochs:
-            snap(ep)
-        if ep % 50 == 0 or ep == num_epochs:
-            print(f'  epoch {ep:4d}  loss {el / (N / batch_size):.4f}')
-    print(f'学習終了（コマ数 {len(frames)}）')
+    _train_loop(model, args, ds.data, num_epochs, batch_size, lr, aux_loss_free,
+                snapshot_cb=snap, snapshot_every=snapshot_every, seed=seed)
     _animate(frames, interval_ms=frame_interval_ms, figsize=(9, 5),
              gif_path=os.path.join(frame_dir, 'arith.gif'))
-    return {'frame_dir': frame_dir, 'target_layer': target_layer}
+    return {'frame_dir': frame_dir, 'target_layer': target_layer, 'aux_loss_free': aux_loss_free}
 
 
 def arith_addition_report(usage, target_layer, ds, n_routed):
@@ -462,18 +493,20 @@ def show_token_experts(model, args, token_ids, ds, layer=None, title=None):
 
 
 def train_jp_with_animation(model, args, ds, num_epochs=400, batch_size=64, lr=2e-3,
-                            snapshot_every=10, frame_interval_ms=600,
+                            aux_loss_free=True, snapshot_every=10, frame_interval_ms=600,
                             frame_dir='jp_frames', sample_size=200, seed=0):
-    """日本語まぜこぜを学習しながら、種類ごとの分業の現れ方を動画にして表示する。"""
-    torch.manual_seed(seed)
-    model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    """日本語まぜこぜを学習しながら、種類ごとの分業の現れ方を動画にして表示する。
+
+    aux_loss_free=True で auxiliary loss を使わず expert bias で負荷分散（DeepSeek-V3 方式）。
+    学習ループは共通の _train_loop を使い回す。
+    """
     layer_ids = _moe_layer_ids(model)
     target_layer = layer_ids[-1]
     nr = args.n_routed_experts
     os.makedirs(frame_dir, exist_ok=True)
     frames = []
     N = ds.data.size(0)
+    # 毎フレーム同じ問題で比べるための固定サンプル（学習前に決めておく）
     torch.manual_seed(seed + 1)
     sample = ds.data[torch.randperm(N)[:sample_size]]
 
@@ -487,29 +520,11 @@ def train_jp_with_animation(model, args, ds, num_epochs=400, batch_size=64, lr=2
                               save_path=p, show=False)
         frames.append(p)
 
-    print(f'学習開始（{num_epochs} エポック, データ {N} 問）')
-    snap(0)
-    for ep in range(1, num_epochs + 1):
-        perm = torch.randperm(N)
-        el = 0.0
-        for i in range(0, N, batch_size):
-            b = ds.data[perm[i:i + batch_size]]
-            opt.zero_grad()
-            loss = model.pretrain(b)
-            loss.backward()
-            opt.step()
-            for layer in model.main_model.layers:
-                if isinstance(layer.feed_forward, dsm.MoE):
-                    layer.feed_forward.update_expert_bias()
-            el += loss.item()
-        if ep % snapshot_every == 0 or ep == num_epochs:
-            snap(ep)
-        if ep % 50 == 0 or ep == num_epochs:
-            print(f'  epoch {ep:4d}  loss {el / (N / batch_size):.4f}')
-    print(f'学習終了（コマ数 {len(frames)}）')
+    _train_loop(model, args, ds.data, num_epochs, batch_size, lr, aux_loss_free,
+                snapshot_cb=snap, snapshot_every=snapshot_every, seed=seed)
     _animate(frames, interval_ms=frame_interval_ms, figsize=(1.2 * nr + 2, 3.2),
              gif_path=os.path.join(frame_dir, 'jp.gif'))
-    return {'frame_dir': frame_dir, 'target_layer': target_layer}
+    return {'frame_dir': frame_dir, 'target_layer': target_layer, 'aux_loss_free': aux_loss_free}
 
 
 def jp_category_report(usage, target_layer, ds):
