@@ -147,6 +147,37 @@ def integration_test(model, args, batch_size=2, seed=42):
     return {'loss': loss.item()}
 
 
+def train_pattern(model, args, tokens, num_epochs=100, lr=1e-3,
+                  aux_loss_free=True, seed=42):
+    """パターン学習「だけ」を行う（確認・グラフは呼び出し側＝Colab で行う）。
+
+    pattern_demo から学習部分だけを切り出した薄いラッパー。model はその場で
+    更新される。確認は学習済み model を使って Colab セルで predict_next を呼ぶ。
+
+    tokens: 形 (batch, context_size + 1 + multi_token_depth) の LongTensor。
+    aux_loss_free: True で auxiliary loss を使わず expert bias で負荷分散（DeepSeek-V3 方式）。
+    """
+    torch.manual_seed(seed)
+    _train_loop(model, args, tokens, num_epochs, batch_size=tokens.size(0), lr=lr,
+                aux_loss_free=aux_loss_free, snapshot_cb=None, seed=seed)
+    return model
+
+
+def predict_next(model, args, ids):
+    """学習済み model に系列 ids を見せて「次トークンのロジット」を返す。
+
+    ids: トークン id の並び（例: [7, 4, 1, 2]）。リストでも 1 次元 LongTensor でも可。
+    戻り値: 最後の位置のロジット（形 (vocab_size,) の Tensor）。
+            次トークンは int(predict_next(...).argmax()) で取り出せる。
+
+    Colab の確認セルから直接呼べるように _forward を公開ラッパーにしたもの。
+    """
+    model.eval()  # ドロップアウトを止めて安定したロジットにする
+    ids = torch.as_tensor(ids, dtype=torch.long).reshape(1, -1)
+    out = _forward(model, args, ids)
+    return out['logits'][0][-1]
+
+
 def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42,
                  aux_loss_free=True, show_plot=True):
     """学習用データ tokens を受け取り、パターン学習を行って結果を確認する。
@@ -164,21 +195,17 @@ def pattern_demo(model, args, tokens=None, num_epochs=100, lr=1e-3, seed=42,
         tokens[0][1:5] = torch.tensor([1, 2, 3, 6])
         tokens[1][10:14] = torch.tensor([1, 2, 3, 9])
 
-    # 学習（共通ループを使い回す。tokens 全体を1バッチとして学習）
-    _train_loop(model, args, tokens, num_epochs, batch_size=tokens.size(0), lr=lr,
-                aux_loss_free=aux_loss_free, snapshot_cb=None, seed=seed)
-
-    model.eval()  # テスト時はドロップアウトを止めて安定したロジットにする
+    # 学習（学習だけを行う train_pattern を使い回す）
+    train_pattern(model, args, tokens, num_epochs=num_epochs, lr=lr,
+                  aux_loss_free=aux_loss_free, seed=seed)
 
     # (1) 「7, 4, 1, 2」 の次 → 3 になってほしい（1,2 の続き）
-    out1 = _forward(model, args, torch.LongTensor([[7, 4, 1, 2]]))
-    last1 = out1['logits'][0][-1]
+    last1 = predict_next(model, args, [7, 4, 1, 2])
     next_after_7412 = int(last1.argmax())
     print('「7, 4, 1, 2」の次に予測したトークン:', next_after_7412, '（期待: 3）')
 
     # (2) 「1, 2, 3」 の次 → 6 か 9 になってほしい
-    out2 = _forward(model, args, torch.LongTensor([[1, 2, 3]]))
-    last2 = out2['logits'][0][-1]
+    last2 = predict_next(model, args, [1, 2, 3])
     next_after_123 = int(last2.argmax())
     print('「1, 2, 3」の次に予測したトークン:', next_after_123, '（期待: 6 または 9）')
 
